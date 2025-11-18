@@ -3,6 +3,7 @@ use csv::{ReaderBuilder, StringRecord};
 use std::error::Error;
 use std::path::PathBuf;
 use comfy_table::{Table, presets::UTF8_FULL};
+use std::collections::VecDeque;
 
 // Defining the command-line interface (clap).
 // The subcommands:
@@ -83,18 +84,19 @@ fn tail(path: &PathBuf, n: usize) -> Result<(), Box<dyn Error>> {
 
     let headers = rdr.headers()?.clone();
 
-    let mut buffer: Vec<StringRecord> = Vec::with_capacity(n);
+    let mut buffer: VecDeque<StringRecord> = Vec::with_capacity(n).into();
     let mut record = StringRecord::new();
 
     while rdr.read_record(&mut record)? {
         if buffer.len() == n {
-            buffer.remove(0);
+            buffer.pop_front();
         }
-        buffer.push(record.clone());
+        buffer.push_back(record.clone());
     }
 
-    let start_idx = if buffer.len() > n { buffer.len() - n } else { 0 };
-    print_table(&buffer[start_idx..], &headers, start_idx);
+    let vec: Vec<_> = buffer.into_iter().collect();
+
+    print_table(&vec, &headers, 0);
     Ok(())
 }
 
@@ -131,12 +133,35 @@ fn shape(path: &PathBuf) -> Result<(), Box<dyn Error>> {
 // - For each row, we try to parse the fields into f64 and update the statistics
 // - After the pass, calculate the mean and std (sample, divided by n-1)
 fn stats(path: &PathBuf) -> Result<(), Box<dyn Error>> {
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_path(path)?;
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(path)?;
 
     let headers = rdr.headers()?.clone();
-    println!("Файл содержит колонок: {}", headers.len());
 
-    // All stats
+    // 1) Creating map index: CSV index -> Option<stat index>
+    let mut index_map: Vec<Option<usize>> = Vec::new();
+    let mut stat_index = 0;
+
+    for (_, header) in headers.iter().enumerate() {
+        let lower = header.to_lowercase();
+
+        // Missing or time/date column
+        if lower.contains("time") || lower.contains("date") || lower.contains("timestamp") {
+            index_map.push(None);
+            continue;
+        }
+
+        // Колонка числовая → включаем
+        index_map.push(Some(stat_index));
+        stat_index += 1;
+    }
+
+    println!("Всего колонок: {}", headers.len());
+    println!("Колонок для статистики: {}", stat_index);
+
+    // 2) Creating stats
     let mut column_stats: Vec<(
         String,                // column name
         Vec<f64>,              // values
@@ -146,65 +171,77 @@ fn stats(path: &PathBuf) -> Result<(), Box<dyn Error>> {
         u64                    // count
     )> = Vec::new();
 
-    for header in headers.iter() {
-        if header == "timestamp" || header.contains("time") || header.contains("date") {
-            continue; // miss timestamp columns
+    for (i, header) in headers.iter().enumerate() {
+        if let Some(_) = index_map[i] {
+            column_stats.push((
+                header.to_string(),
+                Vec::new(),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                0.0,
+                0,
+            ));
         }
-        column_stats.push((header.to_string(), Vec::new(), f64::INFINITY, f64::NEG_INFINITY, 0.0, 0));
     }
 
+    // 3) Reading rows and updating stats
     for result in rdr.records() {
         let record = result?;
-        for (i, field) in record.iter().enumerate() {
-            if i >= column_stats.len() { continue; }
-            if let Ok(value) = field.trim().parse::<f64>() {
-                if let Some(stat) = column_stats.get_mut(i) {
-                    stat.1.push(value);                    // values
-                    stat.2 = stat.2.min(value);           // min
-                    stat.3 = stat.3.max(value);           // max
-                    stat.4 += value;                      // sum
-                    stat.5 += 1;                          // count
-                }
+
+        for (csv_i, field) in record.iter().enumerate() {
+            // сопоставляем CSV -> stats
+            let Some(stat_i) = index_map[csv_i] else { continue };
+
+            let parsed = field.trim().parse::<f64>();
+            if let Ok(value) = parsed {
+                let stat = &mut column_stats[stat_i];
+
+                stat.1.push(value);
+                stat.2 = stat.2.min(value);
+                stat.3 = stat.3.max(value);
+                stat.4 += value;
+                stat.5 += 1;
             }
         }
     }
 
+    // 4) Computing final statistics and printing the table
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL)
-         .set_header(vec!["column", "count", "mean", "std", "min", "25%", "50%", "75%", "max"]);
+    table
+        .load_preset(UTF8_FULL)
+        .set_header(vec!["column", "count", "mean", "std", "min", "25%", "50%", "75%", "max"]);
 
     for (name, mut values, min, max, sum, count) in column_stats {
-        if count == 0 { continue; }
+        if count == 0 {
+            continue;
+        }
 
         let mean = sum / count as f64;
-        
-        // Compute standard deviation
+
+        // standard deviation (sample)
         let std = if values.len() > 1 {
-            let variance = values.iter()
+            let variance: f64 = values.iter()
                 .map(|x| (x - mean).powi(2))
-                .sum::<f64>() / (values.len() - 1) as f64;
+                .sum::<f64>() / ((values.len() - 1) as f64);
             variance.sqrt()
         } else {
             0.0
         };
 
-        // Compute percentiles
+        // percentiles
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        
-        let p25 = if !values.is_empty() { 
-            let idx = (values.len() as f64 * 0.25) as usize;
+
+        let q = |p: f64| -> f64 {
+            if values.is_empty() {
+                return 0.0;
+            }
+            let idx = (p * values.len() as f64).floor() as usize;
             values[idx.min(values.len() - 1)]
-        } else { 0.0 };
-        
-        let p50 = if !values.is_empty() { 
-            let idx = (values.len() as f64 * 0.5) as usize;
-            values[idx.min(values.len() - 1)]
-        } else { 0.0 };
-        
-        let p75 = if !values.is_empty() { 
-            let idx = (values.len() as f64 * 0.75) as usize;
-            values[idx.min(values.len() - 1)]
-        } else { 0.0 };
+        };
+
+        let p25 = q(0.25);
+        let p50 = q(0.50);
+        let p75 = q(0.75);
 
         table.add_row(vec![
             name,
